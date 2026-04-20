@@ -1,17 +1,31 @@
 from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
 from supabase import create_client
 import os
 
 app = FastAPI()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
+# URL fixa do seu projeto Supabase
+SUPABASE_URL = "https://evhatuahmdoobyawmapw.supabase.co"
+
+# Só a chave vem do Railway
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_KEY:
+    raise ValueError("SUPABASE_KEY não configurada no Railway")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 @app.get("/")
 def home():
     return {"status": "ok"}
+
+@app.get("/debug")
+def debug():
+    return {
+        "supabase_url": SUPABASE_URL,
+        "supabase_key_ok": bool(SUPABASE_KEY),
+    }
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -20,16 +34,12 @@ async def webhook(request: Request):
     numero = data.get("From")
     mensagem = data.get("Body")
 
-    print(numero, mensagem)
-
-    # salvar contato
     contato = supabase.table("contatos").upsert({
         "telefone": numero
     }).execute()
 
     contato_id = contato.data[0]["id"]
 
-    # criar conversa
     conversa = supabase.table("conversas").insert({
         "contato_id": contato_id,
         "numero_whatsapp": numero
@@ -37,21 +47,21 @@ async def webhook(request: Request):
 
     conversa_id = conversa.data[0]["id"]
 
-    # salvar mensagem cliente
     supabase.table("mensagens").insert({
         "conversa_id": conversa_id,
         "texto": mensagem,
         "quem_enviou": "cliente"
     }).execute()
 
-    # resposta automática
-    resposta = "Olá! Recebi sua mensagem 👍 Em breve um atendente vai falar com você."
+    resposta = "Olá! Recebi sua mensagem. Em breve um atendente vai falar com você."
 
-    # salvar resposta
     supabase.table("mensagens").insert({
         "conversa_id": conversa_id,
         "texto": resposta,
         "quem_enviou": "bot"
     }).execute()
 
-    return f"<Response><Message>{resposta}</Message></Response>"
+    return PlainTextResponse(
+        f"<Response><Message>{resposta}</Message></Response>",
+        media_type="application/xml"
+    )
