@@ -16,17 +16,22 @@ claude = anthropic.Anthropic(
 )
 
 def perguntar_claude(nome: str, mensagem: str) -> str:
-    response = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=500,
-        system=f"""Voce e um assistente virtual simpatico chamado Robo.
-        Voce esta conversando com {nome} via WhatsApp.
-        Responda de forma curta e amigavel, maximo 3 frases.""",
-        messages=[
-            {"role": "user", "content": mensagem}
-        ]
-    )
-    return response.content[0].text
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system=(
+                f"Voce e um assistente virtual simpatico chamado Robo. "
+                f"Voce esta conversando com {nome} via WhatsApp. "
+                f"Responda de forma curta e amigavel, maximo 3 frases."
+            ),
+            messages=[
+                {"role": "user", "content": mensagem}
+            ]
+        )
+        return response.content[0].text.strip()
+    except Exception:
+        return "Recebi sua mensagem. Ja vou te ajudar."
 
 @app.get("/")
 async def root():
@@ -40,24 +45,42 @@ async def webhook(
     telefone = From
     mensagem = Body.strip()
 
-    resultado = supabase.table("contatos").select("*").eq("telefone", telefone).execute()
-
     resp = MessagingResponse()
 
-    if not resultado.data:
-        supabase.table("contatos").insert({"telefone": telefone, "nome": None}).execute()
-        resp.message("Ola! Seja bem-vindo! Qual e o seu nome?")
+    try:
+        resultado = (
+            supabase.table("contatos")
+            .select("*")
+            .eq("telefone", telefone)
+            .execute()
+        )
 
-    else:
+        if not resultado.data:
+            (
+                supabase.table("contatos")
+                .insert({"telefone": telefone, "nome": None})
+                .execute()
+            )
+            resp.message("Ola! Seja bem-vindo! Qual e o seu nome?")
+            return Response(content=str(resp), media_type="application/xml")
+
         contato = resultado.data[0]
+        nome = contato.get("nome")
 
-        if not contato.get("nome"):
-            supabase.table("contatos").update({"nome": mensagem}).eq("telefone", telefone).execute()
+        if not nome:
+            (
+                supabase.table("contatos")
+                .update({"nome": mensagem})
+                .eq("telefone", telefone)
+                .execute()
+            )
             resp.message(f"Prazer, {mensagem}! Como posso te ajudar?")
+            return Response(content=str(resp), media_type="application/xml")
 
-        else:
-            nome = contato["nome"]
-            resposta_ia = perguntar_claude(nome, mensagem)
-            resp.message(resposta_ia)
+        resposta_ia = perguntar_claude(nome, mensagem)
+        resp.message(resposta_ia)
+        return Response(content=str(resp), media_type="application/xml")
 
-    return Response(content=str(resp), media_type="application/xml")
+    except Exception as e:
+        resp.message(f"Erro interno: {str(e)}")
+        return Response(content=str(resp), media_type="application/xml")
