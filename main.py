@@ -1,5 +1,5 @@
 import os
-import requests
+import pandas as pd
 from fastapi import FastAPI, Form, Response
 from supabase import create_client, Client
 from twilio.twiml.messaging_response import MessagingResponse
@@ -13,7 +13,6 @@ app = FastAPI()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-TINY_API_KEY = os.getenv("TINY_API_KEY")
 
 # =========================
 # CLIENTES
@@ -25,51 +24,90 @@ claude = anthropic.Anthropic(
 )
 
 # =========================
-# FUNÇÃO: BUSCAR PRODUTO NO TINY
+# CARREGAR PLANILHA
 # =========================
-def buscar_produto_tiny(termo_busca: str):
-    """
-    Busca produto no Tiny pelo texto enviado pelo cliente.
-    Retorna dict com nome, preco e codigo se encontrar.
-    Retorna None se não encontrar.
-    """
-    if not TINY_API_KEY:
-        print("ERRO: TINY_API_KEY não configurada.")
-        return None
+ARQUIVO_PRODUTOS = "produtos.xlsx"
 
-    url = "https://api.tiny.com.br/api2/produtos.pesquisa.php"
-
-    params = {
-        "token": TINY_API_KEY,
-        "formato": "json",
-        "pesquisa": termo_busca
-    }
-
+def carregar_produtos():
     try:
-        response = requests.get(url, params=params, timeout=20)
-        data = response.json()
-        print("RETORNO TINY:", data)
+        df = pd.read_excel(ARQUIVO_PRODUTOS)
 
-        retorno = data.get("retorno", {})
-        produtos = retorno.get("produtos", [])
+        # Limpa nomes das colunas
+        df.columns = [str(col).strip() for col in df.columns]
 
-        if not produtos:
-            return None
+        # Garante colunas esperadas
+        for col in [
+            "Código (SKU)",
+            "Descrição",
+            "Preço",
+            "Largura embalagem",
+            "Altura embalagem",
+            "Comprimento embalagem"
+        ]:
+            if col not in df.columns:
+                df[col] = None
 
-        produto = produtos[0].get("produto", {})
+        # Normaliza texto
+        df["Descrição"] = df["Descrição"].fillna("").astype(str)
+        df["Código (SKU)"] = df["Código (SKU)"].fillna("").astype(str)
 
-        return {
-            "nome": produto.get("nome"),
-            "preco": produto.get("preco"),
-            "codigo": produto.get("codigo")
-        }
+        return df
 
     except Exception as e:
-        print("ERRO AO CONSULTAR TINY:", e)
-        return None
+        print("ERRO AO CARREGAR PLANILHA:", e)
+        return pd.DataFrame()
+
+# carrega uma vez ao iniciar
+df_produtos = carregar_produtos()
 
 # =========================
-# FUNÇÃO: PERGUNTAR AO CLAUDE
+# FUNÇÃO: BUSCAR PRODUTO NA PLANILHA
+# =========================
+def buscar_produto_planilha(texto_cliente: str):
+    global df_produtos
+
+    if df_produtos.empty:
+        return None
+
+    termo = texto_cliente.strip().lower()
+
+    # busca por descrição
+    resultados = df_produtos[
+        df_produtos["Descrição"].str.lower().str.contains(termo, na=False)
+    ]
+
+    # se não achar por descrição, tenta por SKU
+    if resultados.empty:
+        resultados = df_produtos[
+            df_produtos["Código (SKU)"].str.lower().str.contains(termo, na=False)
+        ]
+
+    # se ainda não achar, tenta por palavras soltas
+    if resultados.empty:
+        palavras = [p for p in termo.split() if len(p) >= 3]
+
+        if palavras:
+            filtro = pd.Series([True] * len(df_produtos))
+            for palavra in palavras:
+                filtro = filtro & df_produtos["Descrição"].str.lower().str.contains(palavra, na=False)
+            resultados = df_produtos[filtro]
+
+    if resultados.empty:
+        return None
+
+    produto = resultados.iloc[0]
+
+    return {
+        "sku": str(produto.get("Código (SKU)", "")).strip(),
+        "descricao": str(produto.get("Descrição", "")).strip(),
+        "preco": produto.get("Preço"),
+        "largura": produto.get("Largura embalagem"),
+        "altura": produto.get("Altura embalagem"),
+        "comprimento": produto.get("Comprimento embalagem")
+    }
+
+# =========================
+# FUNÇÃO: CLAUDE
 # =========================
 def perguntar_claude(nome: str, mensagem: str) -> str:
     try:
@@ -83,7 +121,7 @@ def perguntar_claude(nome: str, mensagem: str) -> str:
                 f"Nao se apresente toda hora. "
                 f"Nao repita frases. "
                 f"Seja natural, humano, direto e curto. "
-                f"Se o cliente falar de caixas, embalagens, medidas, tamanhos, preco ou quantidade, "
+                f"Se o cliente perguntar por caixas, embalagens, medidas, tamanhos, preco ou quantidade, "
                 f"conduza a conversa para entender a necessidade e fechar a venda."
             ),
             messages=[
@@ -98,14 +136,26 @@ def perguntar_claude(nome: str, mensagem: str) -> str:
         return "Recebi sua mensagem e já vou te ajudar."
 
 # =========================
-# ROTA DE TESTE
+# ROTA TESTE
 # =========================
 @app.get("/")
 async def root():
     return {"status": "Bot rodando!"}
 
 # =========================
-# WEBHOOK WHATSAPP
+# ROTA RECARREGAR PLANILHA
+# =========================
+@app.get("/recarregar-produtos")
+async def recarregar_produtos():
+    global df_produtos
+    df_produtos = carregar_produtos()
+    return {
+        "status": "ok",
+        "total_produtos": len(df_produtos)
+    }
+
+# =========================
+# WEBHOOK
 # =========================
 @app.post("/webhook")
 async def webhook(
@@ -124,9 +174,7 @@ async def webhook(
     resp = MessagingResponse()
 
     try:
-        # =========================
-        # BUSCAR CONTATO
-        # =========================
+        # busca contato
         resultado = (
             supabase.table("contatos")
             .select("*")
@@ -139,12 +187,8 @@ async def webhook(
         if resultado.data and len(resultado.data) > 0:
             contato = resultado.data[0]
 
-        # =========================
-        # NOVO CONTATO
-        # =========================
+        # novo contato
         if not contato:
-            print("NOVO CONTATO - criando no Supabase")
-
             supabase.table("contatos").insert({
                 "telefone": telefone,
                 "nome": None
@@ -155,12 +199,8 @@ async def webhook(
 
         nome = contato.get("nome")
 
-        # =========================
-        # SE AINDA NÃO TEM NOME
-        # =========================
+        # salva nome
         if not nome:
-            print("SALVANDO NOME:", mensagem)
-
             supabase.table("contatos").update({
                 "nome": mensagem
             }).eq("telefone", telefone).execute()
@@ -168,30 +208,28 @@ async def webhook(
             resp.message(f"Prazer, {mensagem}! Como posso te ajudar hoje?")
             return Response(content=str(resp), media_type="application/xml")
 
-        # =========================
-        # TENTAR BUSCAR PRODUTO NO TINY
-        # =========================
-        produto = buscar_produto_tiny(mensagem)
+        # busca produto na planilha
+        produto = buscar_produto_planilha(mensagem)
 
         if produto:
-            nome_produto = produto.get("nome", "Produto")
-            preco_produto = produto.get("preco", "sob consulta")
+            descricao = produto["descricao"]
+            preco = produto["preco"]
+            largura = produto["largura"]
+            altura = produto["altura"]
+            comprimento = produto["comprimento"]
 
             resposta = (
-                f"Tenho sim! {nome_produto} por R$ {preco_produto}. "
+                f"Tenho sim! {descricao}. "
+                f"Preço: R$ {preco}. "
+                f"Medidas da embalagem: {comprimento} x {largura} x {altura}. "
                 f"Quantas unidades você precisa?"
             )
 
-            print("RESPOSTA VIA TINY:", resposta)
             resp.message(resposta)
             return Response(content=str(resp), media_type="application/xml")
 
-        # =========================
-        # SE NÃO ACHAR PRODUTO, USA CLAUDE
-        # =========================
+        # fallback para IA
         resposta_ia = perguntar_claude(nome, mensagem)
-
-        print("RESPOSTA VIA CLAUDE:", resposta_ia)
         resp.message(resposta_ia)
         return Response(content=str(resp), media_type="application/xml")
 
