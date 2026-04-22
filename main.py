@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, Request, Form, Response
+from fastapi import FastAPI, Form, Response
 from supabase import create_client, Client
 from twilio.twiml.messaging_response import MessagingResponse
 
@@ -22,7 +22,6 @@ async def webhook(
     telefone = From
     mensagem = Body.strip()
 
-    # Busca contato no banco
     resultado = supabase.table("contatos")\
         .select("*")\
         .eq("telefone", telefone)\
@@ -31,7 +30,6 @@ async def webhook(
     resp = MessagingResponse()
 
     if not resultado.data:
-        # Primeiro contato — salva e pergunta o nome
         supabase.table("contatos")\
             .insert({"telefone": telefone, "nome": None})\
             .execute()
@@ -41,7 +39,6 @@ async def webhook(
         contato = resultado.data[0]
 
         if not contato.get("nome"):
-            # Ainda não tem nome — salva o nome que veio
             supabase.table("contatos")\
                 .update({"nome": mensagem})\
                 .eq("telefone", telefone)\
@@ -49,13 +46,7 @@ async def webhook(
             resp.message(f"Prazer, {mensagem}! 😊 Como posso te ajudar?")
 
         else:
-            # Já tem nome — responde normalmente
             nome = contato["nome"]
             resp.message(f"Oi {nome}! Recebi sua mensagem: '{mensagem}' 😊")
 
     return Response(content=str(resp), media_type="application/xml")
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
