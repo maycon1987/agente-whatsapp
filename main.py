@@ -1,5 +1,7 @@
 import os
-import pandas as pd
+import csv
+import re
+import unicodedata
 from fastapi import FastAPI, Form, Response
 from supabase import create_client, Client
 from twilio.twiml.messaging_response import MessagingResponse
@@ -24,105 +26,218 @@ claude = anthropic.Anthropic(
 )
 
 # =========================
-# CARREGAR PLANILHA
+# FUNÇÕES ÚTEIS
 # =========================
-ARQUIVO_PRODUTOS = "produtos.xlsx"
+def normalizar_texto(texto: str) -> str:
+    if texto is None:
+        return ""
+    texto = str(texto).strip().lower()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return texto
 
-def carregar_produtos():
-    try:
-        df = pd.read_excel(ARQUIVO_PRODUTOS)
+def limpar_valor(valor):
+    if valor is None:
+        return ""
+    return str(valor).strip()
 
-        # Limpa nomes das colunas
-        df.columns = [str(col).strip() for col in df.columns]
-
-        # Garante colunas esperadas
-        for col in [
-            "Código (SKU)",
-            "Descrição",
-            "Preço",
-            "Largura embalagem",
-            "Altura embalagem",
-            "Comprimento embalagem"
-        ]:
-            if col not in df.columns:
-                df[col] = None
-
-        # Normaliza texto
-        df["Descrição"] = df["Descrição"].fillna("").astype(str)
-        df["Código (SKU)"] = df["Código (SKU)"].fillna("").astype(str)
-
-        return df
-
-    except Exception as e:
-        print("ERRO AO CARREGAR PLANILHA:", e)
-        return pd.DataFrame()
-
-# carrega uma vez ao iniciar
-df_produtos = carregar_produtos()
-
-# =========================
-# FUNÇÃO: BUSCAR PRODUTO NA PLANILHA
-# =========================
-def buscar_produto_planilha(texto_cliente: str):
-    global df_produtos
-
-    if df_produtos.empty:
+def extrair_medidas_do_texto(texto: str):
+    """
+    Tenta achar medidas tipo:
+    30x20x15
+    30 x 20 x 15
+    """
+    texto_norm = normalizar_texto(texto)
+    match = re.search(r"(\d+(?:[.,]\d+)?)\s*x\s*(\d+(?:[.,]\d+)?)\s*x\s*(\d+(?:[.,]\d+)?)", texto_norm)
+    if not match:
         return None
 
-    termo = texto_cliente.strip().lower()
+    def to_float(v):
+        return float(v.replace(",", "."))
 
-    # busca por descrição
-    resultados = df_produtos[
-        df_produtos["Descrição"].str.lower().str.contains(termo, na=False)
+    return (
+        to_float(match.group(1)),
+        to_float(match.group(2)),
+        to_float(match.group(3)),
+    )
+
+def para_float(valor):
+    if valor is None:
+        return None
+    valor = str(valor).strip().replace(".", "").replace(",", ".")
+    try:
+        return float(valor)
+    except:
+        try:
+            # se já vier em formato normal
+            return float(str(valor).strip())
+        except:
+            return None
+
+# =========================
+# CARREGAR PRODUTOS CSV
+# =========================
+def carregar_produtos():
+    produtos = []
+
+    caminhos_teste = [
+        "produtos.csv",
+        "./produtos.csv",
+        "/app/produtos.csv"
     ]
 
-    # se não achar por descrição, tenta por SKU
-    if resultados.empty:
-        resultados = df_produtos[
-            df_produtos["Código (SKU)"].str.lower().str.contains(termo, na=False)
-        ]
+    arquivo_encontrado = None
 
-    # se ainda não achar, tenta por palavras soltas
-    if resultados.empty:
-        palavras = [p for p in termo.split() if len(p) >= 3]
+    for caminho in caminhos_teste:
+        if os.path.exists(caminho):
+            arquivo_encontrado = caminho
+            break
 
-        if palavras:
-            filtro = pd.Series([True] * len(df_produtos))
-            for palavra in palavras:
-                filtro = filtro & df_produtos["Descrição"].str.lower().str.contains(palavra, na=False)
-            resultados = df_produtos[filtro]
+    if not arquivo_encontrado:
+        print("ERRO: produtos.csv não encontrado.")
+        return produtos
 
-    if resultados.empty:
-        return None
+    try:
+        with open(arquivo_encontrado, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # normaliza cabeçalhos
+                row_normalizado = {}
+                for chave, valor in row.items():
+                    row_normalizado[normalizar_texto(chave)] = limpar_valor(valor)
 
-    produto = resultados.iloc[0]
+                produtos.append(row_normalizado)
 
-    return {
-        "sku": str(produto.get("Código (SKU)", "")).strip(),
-        "descricao": str(produto.get("Descrição", "")).strip(),
-        "preco": produto.get("Preço"),
-        "largura": produto.get("Largura embalagem"),
-        "altura": produto.get("Altura embalagem"),
-        "comprimento": produto.get("Comprimento embalagem")
-    }
+        print(f"CSV carregado com sucesso. Total de produtos: {len(produtos)}")
+
+    except Exception as e:
+        print("ERRO AO LER CSV:", e)
+
+    return produtos
+
+PRODUTOS = carregar_produtos()
 
 # =========================
-# FUNÇÃO: CLAUDE
+# BUSCAR PRODUTO NO CSV
+# =========================
+def buscar_produto_csv(mensagem_usuario: str):
+    """
+    Busca primeiro por medida (30x20x15).
+    Se não achar, busca por palavras na descrição / SKU.
+    """
+    texto = normalizar_texto(mensagem_usuario)
+
+    if not PRODUTOS:
+        return None
+
+    # ---------------------------------
+    # 1) TENTAR BUSCAR POR MEDIDAS
+    # ---------------------------------
+    medidas = extrair_medidas_do_texto(texto)
+    if medidas:
+        comp_msg, larg_msg, alt_msg = medidas
+
+        for p in PRODUTOS:
+            comp = para_float(p.get("comprimento embalagem"))
+            larg = para_float(p.get("largura embalagem"))
+            alt = para_float(p.get("altura embalagem"))
+
+            if comp is None or larg is None or alt is None:
+                continue
+
+            # compara exatamente
+            if comp == comp_msg and larg == larg_msg and alt == alt_msg:
+                return p
+
+            # também tenta ordem alternativa comum
+            if (
+                {comp, larg, alt} == {comp_msg, larg_msg, alt_msg}
+            ):
+                return p
+
+    # ---------------------------------
+    # 2) TENTAR BUSCAR POR DESCRIÇÃO / SKU
+    # ---------------------------------
+    palavras = [p for p in texto.split() if len(p) >= 3]
+
+    melhor_produto = None
+    melhor_pontuacao = 0
+
+    for p in PRODUTOS:
+        descricao = normalizar_texto(p.get("descricao"))
+        sku = normalizar_texto(p.get("codigo (sku)"))
+        categoria = normalizar_texto(p.get("categoria"))
+        marca = normalizar_texto(p.get("marca"))
+
+        campo_busca = f"{descricao} {sku} {categoria} {marca}"
+
+        pontuacao = 0
+        for palavra in palavras:
+            if palavra in campo_busca:
+                pontuacao += 1
+
+        if pontuacao > melhor_pontuacao:
+            melhor_pontuacao = pontuacao
+            melhor_produto = p
+
+    if melhor_pontuacao > 0:
+        return melhor_produto
+
+    return None
+
+# =========================
+# MONTAR RESPOSTA DO PRODUTO
+# =========================
+def montar_resposta_produto(produto):
+    descricao = produto.get("descricao", "Produto")
+    preco = produto.get("preco", "")
+    estoque = produto.get("estoque", "")
+    sku = produto.get("codigo (sku)", "")
+
+    largura = produto.get("largura embalagem", "")
+    altura = produto.get("altura embalagem", "")
+    comprimento = produto.get("comprimento embalagem", "")
+
+    partes = []
+
+    partes.append(f"Tenho sim! {descricao}.")
+
+    medidas_ok = largura or altura or comprimento
+    if medidas_ok:
+        partes.append(
+            f"Medidas da embalagem: {comprimento} x {largura} x {altura}."
+        )
+
+    if preco:
+        partes.append(f"Preço: R$ {preco}.")
+
+    if estoque:
+        partes.append(f"Estoque atual: {estoque}.")
+
+    if sku:
+        partes.append(f"Código: {sku}.")
+
+    partes.append("Quantas unidades você precisa?")
+
+    return " ".join(partes)
+
+# =========================
+# CLAUDE
 # =========================
 def perguntar_claude(nome: str, mensagem: str) -> str:
     try:
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=300,
+            max_tokens=250,
             system=(
                 f"Voce e um vendedor especialista em WhatsApp chamado Robo. "
                 f"Voce conversa com {nome}. "
                 f"Seu objetivo e ajudar e vender. "
                 f"Nao se apresente toda hora. "
                 f"Nao repita frases. "
-                f"Seja natural, humano, direto e curto. "
-                f"Se o cliente perguntar por caixas, embalagens, medidas, tamanhos, preco ou quantidade, "
-                f"conduza a conversa para entender a necessidade e fechar a venda."
+                f"Seja natural, direto, curto e humano. "
+                f"Se o cliente perguntar sobre embalagens, caixas, medidas, preco ou quantidade, "
+                f"conduza para venda com perguntas objetivas."
             ),
             messages=[
                 {"role": "user", "content": mensagem}
@@ -140,22 +255,20 @@ def perguntar_claude(nome: str, mensagem: str) -> str:
 # =========================
 @app.get("/")
 async def root():
-    return {"status": "Bot rodando!"}
+    return {"status": "ok"}
 
 # =========================
-# ROTA RECARREGAR PLANILHA
+# ROTA TESTE CSV
 # =========================
-@app.get("/recarregar-produtos")
-async def recarregar_produtos():
-    global df_produtos
-    df_produtos = carregar_produtos()
+@app.get("/debug-produtos")
+async def debug_produtos():
     return {
-        "status": "ok",
-        "total_produtos": len(df_produtos)
+        "total_produtos": len(PRODUTOS),
+        "primeiro_produto": PRODUTOS[0] if PRODUTOS else None
     }
 
 # =========================
-# WEBHOOK
+# WEBHOOK WHATSAPP
 # =========================
 @app.post("/webhook")
 async def webhook(
@@ -174,7 +287,9 @@ async def webhook(
     resp = MessagingResponse()
 
     try:
-        # busca contato
+        # -------------------------
+        # BUSCAR CONTATO
+        # -------------------------
         resultado = (
             supabase.table("contatos")
             .select("*")
@@ -183,12 +298,15 @@ async def webhook(
         )
 
         contato = None
-
         if resultado.data and len(resultado.data) > 0:
             contato = resultado.data[0]
 
-        # novo contato
+        # -------------------------
+        # NOVO CONTATO
+        # -------------------------
         if not contato:
+            print("NOVO CONTATO")
+
             supabase.table("contatos").insert({
                 "telefone": telefone,
                 "nome": None
@@ -199,8 +317,12 @@ async def webhook(
 
         nome = contato.get("nome")
 
-        # salva nome
+        # -------------------------
+        # AINDA SEM NOME
+        # -------------------------
         if not nome:
+            print("SALVANDO NOME:", mensagem)
+
             supabase.table("contatos").update({
                 "nome": mensagem
             }).eq("telefone", telefone).execute()
@@ -208,28 +330,22 @@ async def webhook(
             resp.message(f"Prazer, {mensagem}! Como posso te ajudar hoje?")
             return Response(content=str(resp), media_type="application/xml")
 
-        # busca produto na planilha
-        produto = buscar_produto_planilha(mensagem)
+        # -------------------------
+        # BUSCA NA PLANILHA
+        # -------------------------
+        produto = buscar_produto_csv(mensagem)
 
         if produto:
-            descricao = produto["descricao"]
-            preco = produto["preco"]
-            largura = produto["largura"]
-            altura = produto["altura"]
-            comprimento = produto["comprimento"]
-
-            resposta = (
-                f"Tenho sim! {descricao}. "
-                f"Preço: R$ {preco}. "
-                f"Medidas da embalagem: {comprimento} x {largura} x {altura}. "
-                f"Quantas unidades você precisa?"
-            )
-
+            resposta = montar_resposta_produto(produto)
+            print("RESPOSTA VIA CSV:", resposta)
             resp.message(resposta)
             return Response(content=str(resp), media_type="application/xml")
 
-        # fallback para IA
+        # -------------------------
+        # IA RESPONDE
+        # -------------------------
         resposta_ia = perguntar_claude(nome, mensagem)
+        print("RESPOSTA VIA CLAUDE:", resposta_ia)
         resp.message(resposta_ia)
         return Response(content=str(resp), media_type="application/xml")
 
