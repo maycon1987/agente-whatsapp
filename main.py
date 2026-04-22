@@ -1,370 +1,386 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import Response
 import os
-import csv
 import re
-import unicodedata
+import json
+import pandas as pd
+from fastapi import FastAPI, Form, Response
+from supabase import create_client, Client
 from twilio.twiml.messaging_response import MessagingResponse
-from anthropic import Anthropic
+import anthropic
 
 app = FastAPI()
 
-# ================================
+# =========================
 # CONFIG
-# ================================
+# =========================
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ================================
-# DEBUG
-# ================================
-print("========== DEBUG ==========")
-print("ARQUIVOS:", os.listdir())
-print("===========================")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ================================
-# FUNÇÕES AUXILIARES
-# ================================
-def normalizar_texto(texto):
-    if texto is None:
-        return ""
+ARQUIVO_PRODUTOS = "produtos.xlsx"
+
+
+# =========================
+# CARREGAR EXCEL
+# =========================
+def carregar_produtos():
+    try:
+        df = pd.read_excel(ARQUIVO_PRODUTOS)
+        df.columns = [str(c).strip().lower() for c in df.columns]
+
+        colunas_necessarias = ["nome", "modelo", "medida", "preco", "descricao"]
+        for col in colunas_necessarias:
+            if col not in df.columns:
+                df[col] = ""
+
+        df = df.fillna("")
+        return df
+
+    except Exception as e:
+        print("ERRO AO CARREGAR EXCEL:", e)
+        return pd.DataFrame(columns=["nome", "modelo", "medida", "preco", "descricao"])
+
+
+produtos_df = carregar_produtos()
+
+
+# =========================
+# UTILS
+# =========================
+def normalizar_texto(texto: str) -> str:
     texto = str(texto).strip().lower()
-    texto = unicodedata.normalize("NFKD", texto)
-    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    texto = texto.replace("caixa de papelão", "caixa")
+    texto = texto.replace("caixa de papelao", "caixa")
+    texto = texto.replace(",", ".")
     return texto
 
-def para_float(valor):
-    if valor is None:
-        return None
 
-    valor = str(valor).strip()
-    if not valor:
-        return None
+def normalizar_medida(texto: str) -> str:
+    texto = normalizar_texto(texto)
+    texto = texto.replace(" ", "")
+    texto = texto.replace("*", "x")
+    texto = texto.replace("×", "x")
 
-    try:
-        return float(valor.replace(".", "").replace(",", "."))
-    except:
-        try:
-            return float(valor.replace(",", "."))
-        except:
-            return None
+    # remove casas decimais .0 desnecessárias se quiser comparar mais fácil
+    return texto
 
-def formatar_reais(valor):
-    try:
-        return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except:
-        return str(valor)
 
-def extrair_medidas(texto):
+def extrair_medida_regex(texto: str):
+    texto = normalizar_medida(texto)
+    padrao = r'(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)'
+    achou = re.search(padrao, texto)
+
+    if achou:
+        return f"{achou.group(1)}x{achou.group(2)}x{achou.group(3)}"
+    return None
+
+
+def extrair_modelo_regex(texto: str):
     texto = normalizar_texto(texto)
 
-    # 18x14,5x8,5
-    match = re.search(r"(\d+(?:[.,]\d+)?)\s*x\s*(\d+(?:[.,]\d+)?)\s*x\s*(\d+(?:[.,]\d+)?)", texto)
-    if match:
-        return (
-            float(match.group(1).replace(",", ".")),
-            float(match.group(2).replace(",", ".")),
-            float(match.group(3).replace(",", "."))
-        )
-
+    # captura tipo n18, n20, n 18
+    padrao = r'\bn\s*?(\d{1,3})\b'
+    achou = re.search(padrao, texto)
+    if achou:
+        return f"n{achou.group(1)}"
     return None
 
-def extrair_quantidade_do_nome(nome_produto):
+
+# =========================
+# IA PARA INTERPRETAR A PERGUNTA
+# =========================
+def interpretar_pergunta(mensagem: str):
     """
-    Exemplos:
-    'Caixa ... - 25unds' -> 25
-    'Caixa ... - 1un' -> 1
+    A IA interpreta a intenção e tenta extrair:
+    - tipo_busca: medida | modelo | nome | desconhecido
+    - valor
+    - intencao: preco | disponibilidade | compra | duvida
     """
-    nome = normalizar_texto(nome_produto)
-    match = re.search(r"-\s*(\d+)\s*(un|unds|unidade|unidades)", nome)
-    if match:
-        return int(match.group(1))
-    return None
+    prompt = f"""
+Você é um extrator de intenção para um bot de vendas de caixas de papelão.
+Analise a mensagem do cliente e devolva SOMENTE JSON válido.
 
-def limpar_nome_base(nome_produto):
-    nome = str(nome_produto).strip()
-    nome = re.sub(r"\s*-\s*\d+\s*(un|unds|unidade|unidades)\s*$", "", nome, flags=re.IGNORECASE)
-    return nome.strip()
+Regras:
+- Se houver medida como 30x20x15, use tipo_busca = "medida"
+- Se houver modelo como N18, use tipo_busca = "modelo"
+- Se citar um nome de produto sem medida/modelo, use tipo_busca = "nome"
+- Se não der para entender, use tipo_busca = "desconhecido"
+- intencao deve ser uma destas:
+  "preco", "disponibilidade", "compra", "duvida"
+- valor deve ser string
+- Não escreva nada fora do JSON
 
-# ================================
-# LEITURA CSV
-# ================================
-def carregar_produtos():
-    produtos = []
-
-    try:
-        with open("produtos.csv", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                produtos.append(row)
-    except Exception as e:
-        print("ERRO AO LER CSV:", e)
-
-    return produtos
-
-# ================================
-# CAMPOS DA PLANILHA
-# ================================
-def descricao_produto(p):
-    return p.get("Descrição", "") or ""
-
-def preco_produto(p):
-    return para_float(p.get("Preço"))
-
-def imagem_produto(p):
-    return (p.get("URL imagem 1", "") or "").strip()
-
-# ================================
-# BUSCA DO PRODUTO BASE
-# ================================
-def pontuar_produto(texto_usuario, nome_base):
-    texto = normalizar_texto(texto_usuario)
-    descricao = normalizar_texto(nome_base)
-
-    pontuacao = 0
-
-    # frase inteira
-    if texto and texto in descricao:
-        pontuacao += 50
-
-    # palavras
-    palavras = [p for p in texto.split() if len(p) >= 2]
-    for palavra in palavras:
-        if palavra in descricao:
-            pontuacao += 10
-
-    # medidas
-    medidas = extrair_medidas(texto)
-    if medidas:
-        c, l, a = medidas
-
-        medidas_textos = [
-            f"{str(c).replace('.0','')}x{str(l).replace('.0','')}x{str(a).replace('.0','')}",
-            f"{str(c).replace('.', ',').replace(',0','')}x{str(l).replace('.', ',').replace(',0','')}x{str(a).replace('.', ',').replace(',0','')}"
-        ]
-
-        for mt in medidas_textos:
-            if mt in descricao:
-                pontuacao += 40
-                break
-
-    return pontuacao
-
-def encontrar_melhor_nome_base(mensagem, produtos):
-    melhor_base = None
-    melhor_pontuacao = 0
-
-    bases_vistas = set()
-
-    for p in produtos:
-        nome = descricao_produto(p)
-        base = limpar_nome_base(nome)
-        base_norm = normalizar_texto(base)
-
-        if base_norm in bases_vistas:
-            continue
-        bases_vistas.add(base_norm)
-
-        score = pontuar_produto(mensagem, base)
-
-        if score > melhor_pontuacao:
-            melhor_pontuacao = score
-            melhor_base = base
-
-    if melhor_pontuacao <= 0:
-        return None
-
-    print("MELHOR BASE:", melhor_base, "| SCORE:", melhor_pontuacao)
-    return melhor_base
-
-# ================================
-# AGRUPAR PREÇOS POR FAIXA
-# ================================
-def montar_tabela_precos(nome_base, produtos):
-    """
-    Retorna:
-    {
-      "base": {...},
-      "1": {...},
-      "25": {...},
-      "50": {...},
-      "100": {...},
-      "250": {...},
-      "500": {...},
-      "1000": {...}
-    }
-    """
-    tabela = {}
-
-    for p in produtos:
-        nome = descricao_produto(p)
-        base = limpar_nome_base(nome)
-
-        if normalizar_texto(base) != normalizar_texto(nome_base):
-            continue
-
-        qtd = extrair_quantidade_do_nome(nome)
-
-        if qtd is None:
-            tabela["base"] = p
-        else:
-            tabela[str(qtd)] = p
-
-    return tabela
-
-# ================================
-# RESPOSTA DE PREÇOS
-# ================================
-def montar_resposta_precos(nome_base, tabela):
-    partes = []
-    partes.append(f"Encontrei os valores para {nome_base}:")
-
-    # varejo
-    varejo = None
-
-    if "1" in tabela and preco_produto(tabela["1"]) is not None:
-        varejo = preco_produto(tabela["1"])
-    elif "base" in tabela and preco_produto(tabela["base"]) is not None:
-        varejo = preco_produto(tabela["base"])
-
-    if varejo is not None:
-        partes.append(f"Varejo (1 unidade): R$ {formatar_reais(varejo)}.")
-
-    # atacado
-    faixas = [25, 50, 100, 250, 500, 1000]
-    linhas_atacado = []
-
-    for faixa in faixas:
-        chave = str(faixa)
-        if chave in tabela:
-            valor_total = preco_produto(tabela[chave])
-            if valor_total is not None:
-                valor_unit = round(valor_total / faixa, 4)
-                linhas_atacado.append(
-                    f"{faixa}un: R$ {formatar_reais(valor_total)} no total (R$ {formatar_reais(valor_unit)} por unidade)"
-                )
-
-    if linhas_atacado:
-        partes.append("Atacado:")
-        partes.extend(linhas_atacado)
-
-    partes.append("Se quiser, me diga a quantidade que eu te indico a melhor faixa.")
-    return " ".join(partes)
-
-# ================================
-# PEGAR IMAGEM
-# ================================
-def encontrar_imagem_principal(tabela):
-    """
-    Prioridade:
-    1) base
-    2) 1un
-    3) qualquer faixa
-    """
-    if "base" in tabela:
-        url = imagem_produto(tabela["base"])
-        if url:
-            return url
-
-    if "1" in tabela:
-        url = imagem_produto(tabela["1"])
-        if url:
-            return url
-
-    for chave in ["25", "50", "100", "250", "500", "1000"]:
-        if chave in tabela:
-            url = imagem_produto(tabela[chave])
-            if url:
-                return url
-
-    return None
-
-# ================================
-# CLAUDE (fallback)
-# ================================
-def gerar_resposta_claude(mensagem):
-    try:
-        prompt = f"""
-Você é um vendedor de caixas de papelão no WhatsApp.
-Responda de forma curta, natural e objetiva.
-Se o cliente não informar medida, peça comprimento, largura e altura.
 Mensagem do cliente:
 {mensagem}
+
+Formato de saída:
+{{
+  "tipo_busca": "medida",
+  "valor": "30x20x15",
+  "intencao": "preco"
+}}
 """
 
-        resposta = client.messages.create(
+    try:
+        response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=220,
+            max_tokens=200,
             messages=[{"role": "user", "content": prompt}]
         )
 
-        return resposta.content[0].text.strip()
+        texto = response.content[0].text.strip()
+        dados = json.loads(texto)
+
+        return {
+            "tipo_busca": str(dados.get("tipo_busca", "desconhecido")).strip().lower(),
+            "valor": str(dados.get("valor", "")).strip(),
+            "intencao": str(dados.get("intencao", "duvida")).strip().lower()
+        }
 
     except Exception as e:
-        print("ERRO CLAUDE:", e)
-        return "Para eu achar o modelo mais próximo, me passe o comprimento, largura e altura. Exemplo: 18x14,5x8,5."
+        print("ERRO AO INTERPRETAR COM IA:", e)
 
-# ================================
-# WEBHOOK
-# ================================
-@app.post("/webhook")
-async def webhook(request: Request):
-    form = await request.form()
-    mensagem = (form.get("Body") or "").strip()
-    telefone = (form.get("From") or "").strip()
+        # fallback inteligente sem IA
+        medida = extrair_medida_regex(mensagem)
+        if medida:
+            return {
+                "tipo_busca": "medida",
+                "valor": medida,
+                "intencao": "preco" if "valor" in mensagem.lower() or "preço" in mensagem.lower() or "preco" in mensagem.lower() else "disponibilidade"
+            }
 
-    print("MENSAGEM:", mensagem)
-    print("TELEFONE:", telefone)
+        modelo = extrair_modelo_regex(mensagem)
+        if modelo:
+            return {
+                "tipo_busca": "modelo",
+                "valor": modelo,
+                "intencao": "preco" if "valor" in mensagem.lower() or "preço" in mensagem.lower() or "preco" in mensagem.lower() else "disponibilidade"
+            }
 
-    produtos = carregar_produtos()
-    twilio_response = MessagingResponse()
+        return {
+            "tipo_busca": "desconhecido",
+            "valor": "",
+            "intencao": "duvida"
+        }
 
+
+# =========================
+# BUSCA NO EXCEL
+# =========================
+def buscar_produto_no_excel(mensagem: str):
+    global produtos_df
+
+    if produtos_df.empty:
+        return None
+
+    interpretacao = interpretar_pergunta(mensagem)
+    tipo_busca = interpretacao["tipo_busca"]
+    valor = normalizar_texto(interpretacao["valor"])
+    intencao = interpretacao["intencao"]
+
+    print("INTERPRETACAO:", interpretacao)
+
+    # Primeiro tenta busca direta por regex local, porque ajuda bastante
+    medida_local = extrair_medida_regex(mensagem)
+    modelo_local = extrair_modelo_regex(mensagem)
+
+    if tipo_busca == "medida" or medida_local:
+        medida_busca = normalizar_medida(medida_local or valor)
+
+        for _, row in produtos_df.iterrows():
+            medida_planilha = normalizar_medida(row.get("medida", ""))
+            if medida_planilha == medida_busca:
+                return {
+                    "nome": row.get("nome", ""),
+                    "modelo": row.get("modelo", ""),
+                    "medida": row.get("medida", ""),
+                    "preco": row.get("preco", ""),
+                    "descricao": row.get("descricao", ""),
+                    "intencao": intencao
+                }
+
+    if tipo_busca == "modelo" or modelo_local:
+        modelo_busca = normalizar_texto(modelo_local or valor).replace(" ", "")
+
+        for _, row in produtos_df.iterrows():
+            modelo_planilha = normalizar_texto(row.get("modelo", "")).replace(" ", "")
+            nome_planilha = normalizar_texto(row.get("nome", "")).replace(" ", "")
+
+            if modelo_planilha == modelo_busca or modelo_busca in nome_planilha:
+                return {
+                    "nome": row.get("nome", ""),
+                    "modelo": row.get("modelo", ""),
+                    "medida": row.get("medida", ""),
+                    "preco": row.get("preco", ""),
+                    "descricao": row.get("descricao", ""),
+                    "intencao": intencao
+                }
+
+    if tipo_busca == "nome" and valor:
+        valor_norm = normalizar_texto(valor)
+
+        for _, row in produtos_df.iterrows():
+            nome_planilha = normalizar_texto(row.get("nome", ""))
+            descricao_planilha = normalizar_texto(row.get("descricao", ""))
+
+            if valor_norm in nome_planilha or valor_norm in descricao_planilha:
+                return {
+                    "nome": row.get("nome", ""),
+                    "modelo": row.get("modelo", ""),
+                    "medida": row.get("medida", ""),
+                    "preco": row.get("preco", ""),
+                    "descricao": row.get("descricao", ""),
+                    "intencao": intencao
+                }
+
+    return None
+
+
+# =========================
+# RESPOSTA DE VENDAS COM IA
+# =========================
+def responder_com_ia(nome_cliente: str, mensagem: str) -> str:
     try:
-        nome_base = encontrar_melhor_nome_base(mensagem, produtos)
-
-        if nome_base:
-            tabela = montar_tabela_precos(nome_base, produtos)
-            resposta_texto = montar_resposta_precos(nome_base, tabela)
-
-            msg = twilio_response.message(resposta_texto)
-
-            # envia imagem junto, se existir
-            url_imagem = encontrar_imagem_principal(tabela)
-            if url_imagem:
-                print("IMAGEM ENCONTRADA:", url_imagem)
-                msg.media(url_imagem)
-            else:
-                print("SEM IMAGEM PARA ESTE PRODUTO")
-
-            return Response(content=str(twilio_response), media_type="application/xml")
-
-        # fallback se não achou produto
-        resposta_texto = (
-            "Para eu encontrar o modelo mais próximo, me passe o comprimento, largura e altura. "
-            "Exemplo: 18x14,5x8,5."
+        response = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system=(
+                f"Você é um vendedor especialista em caixas de papelão via WhatsApp. "
+                f"Você conversa com {nome_cliente}. "
+                f"Seja natural, curto, direto e humano. "
+                f"Nunca invente preço ou medida se não tiver certeza. "
+                f"Quando faltar informação, faça uma pergunta objetiva."
+            ),
+            messages=[
+                {"role": "user", "content": mensagem}
+            ]
         )
 
-        twilio_response.message(resposta_texto)
-        return Response(content=str(twilio_response), media_type="application/xml")
+        return response.content[0].text.strip()
 
     except Exception as e:
-        print("ERRO GERAL NO WEBHOOK:", e)
-        twilio_response.message(
-            "Tive um probleminha interno agora. Me manda o comprimento, largura e altura da caixa que você precisa."
-        )
-        return Response(content=str(twilio_response), media_type="application/xml")
+        print("ERRO RESPOSTA IA:", e)
+        return "Recebi sua mensagem. Me diga o modelo ou a medida da caixa que você procura."
 
-# ================================
-# TESTES
-# ================================
+
+# =========================
+# MONTAR RESPOSTA A PARTIR DO EXCEL
+# =========================
+def montar_resposta_produto(produto: dict) -> str:
+    nome = produto.get("nome", "")
+    modelo = produto.get("modelo", "")
+    medida = produto.get("medida", "")
+    preco = produto.get("preco", "")
+    descricao = produto.get("descricao", "")
+    intencao = produto.get("intencao", "duvida")
+
+    titulo = nome
+    if modelo:
+        titulo += f" ({modelo})"
+
+    detalhes = []
+    if medida:
+        detalhes.append(f"medida {medida}")
+    if preco != "":
+        detalhes.append(f"R$ {preco}")
+
+    detalhes_txt = ", ".join(detalhes)
+
+    if intencao == "preco":
+        if preco != "":
+            return f"Tenho sim! {titulo} - {detalhes_txt}. Quantas unidades você precisa?"
+        return f"Encontrei {titulo}, mas o preço não está cadastrado. Quer que eu te ajude com quantidade ou medida?"
+
+    if intencao == "disponibilidade":
+        if detalhes_txt:
+            return f"Tenho sim! {titulo} - {detalhes_txt}. Quantas unidades você precisa?"
+        return f"Tenho sim! {titulo}. Quantas unidades você precisa?"
+
+    if intencao == "compra":
+        return f"Perfeito! {titulo} - {detalhes_txt}. Quantas unidades você deseja?"
+
+    return f"Encontrei {titulo} - {detalhes_txt}. Quer saber preço, quantidade ou mais detalhes?"
+
+
+# =========================
+# ENDPOINTS
+# =========================
 @app.get("/")
-def home():
+async def root():
     return {"status": "ok"}
 
-@app.get("/debug-produtos")
-def debug_produtos():
-    produtos = carregar_produtos()
+
+@app.get("/debug")
+async def debug():
     return {
-        "total_produtos": len(produtos),
-        "primeiro_produto": produtos[0] if produtos else None
+        "status": "ok",
+        "arquivo_produtos": ARQUIVO_PRODUTOS,
+        "qtd_produtos": int(len(produtos_df))
     }
+
+
+@app.post("/webhook")
+async def webhook(
+    From: str = Form(...),
+    Body: str = Form(...)
+):
+    telefone = From
+    mensagem = Body.strip()
+
+    print("MENSAGEM RECEBIDA:", telefone, mensagem)
+
+    resp = MessagingResponse()
+
+    try:
+        # Atualiza dataframe a cada mensagem para refletir mudanças no arquivo
+        global produtos_df
+        produtos_df = carregar_produtos()
+
+        # Busca ou cria contato
+        resultado = (
+            supabase.table("contatos")
+            .select("*")
+            .eq("telefone", telefone)
+            .execute()
+        )
+
+        if not resultado.data:
+            supabase.table("contatos").insert({
+                "telefone": telefone,
+                "nome": None
+            }).execute()
+
+            resp.message("Olá! Seja bem-vindo 😊 Qual é o seu nome?")
+            return Response(content=str(resp), media_type="application/xml")
+
+        contato = resultado.data[0]
+        nome_cliente = contato.get("nome")
+
+        # Se ainda não tem nome salvo
+        if not nome_cliente:
+            supabase.table("contatos").update({
+                "nome": mensagem
+            }).eq("telefone", telefone).execute()
+
+            resp.message(f"Prazer, {mensagem}! Me diga o modelo ou a medida da caixa que você procura.")
+            return Response(content=str(resp), media_type="application/xml")
+
+        # PRIMEIRO: tenta achar produto no Excel
+        produto = buscar_produto_no_excel(mensagem)
+
+        if produto:
+            resposta = montar_resposta_produto(produto)
+            resp.message(resposta)
+            return Response(content=str(resp), media_type="application/xml")
+
+        # Se não achou produto, IA responde sem inventar preço
+        resposta_ia = responder_com_ia(nome_cliente, mensagem)
+        resp.message(resposta_ia)
+        return Response(content=str(resp), media_type="application/xml")
+
+    except Exception as e:
+        print("ERRO GERAL WEBHOOK:", e)
+        resp.message("Tive um erro interno aqui, mas já estou corrigindo. Pode mandar novamente em alguns segundos?")
+        return Response(content=str(resp), media_type="application/xml")
