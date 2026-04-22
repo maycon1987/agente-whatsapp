@@ -17,7 +17,7 @@ claude = anthropic.Anthropic(
 
 def perguntar_claude(nome: str, mensagem: str) -> str:
     response = claude.messages.create(
-        model="claude-opus-4-20250514",
+        model="claude-haiku-4-5-20251001",
         max_tokens=500,
         system=f"""Voce e um assistente virtual simpatico chamado Robo.
         Voce esta conversando com {nome} via WhatsApp.
