@@ -2,6 +2,7 @@ import os
 from fastapi import FastAPI, Form, Response
 from supabase import create_client, Client
 from twilio.twiml.messaging_response import MessagingResponse
+import anthropic
 
 app = FastAPI()
 
@@ -9,6 +10,23 @@ supabase: Client = create_client(
     os.environ["SUPABASE_URL"],
     os.environ["SUPABASE_KEY"]
 )
+
+claude = anthropic.Anthropic(
+    api_key=os.environ["ANTHROPIC_API_KEY"]
+)
+
+def perguntar_claude(nome: str, mensagem: str) -> str:
+    response = claude.messages.create(
+        model="claude-opus-4-20250514",
+        max_tokens=500,
+        system=f"""Você é um assistente virtual simpático e prestativo chamado Robo. 
+        Você está conversando com {nome} via WhatsApp.
+        Responda de forma curta e amigável, máximo 3 frases.""",
+        messages=[
+            {"role": "user", "content": mensagem}
+        ]
+    )
+    return response.content[0].text
 
 @app.get("/")
 async def root():
@@ -30,23 +48,4 @@ async def webhook(
     resp = MessagingResponse()
 
     if not resultado.data:
-        supabase.table("contatos")\
-            .insert({"telefone": telefone, "nome": None})\
-            .execute()
-        resp.message("Olá! 👋 Seja bem-vindo! Qual é o seu nome?")
-
-    else:
-        contato = resultado.data[0]
-
-        if not contato.get("nome"):
-            supabase.table("contatos")\
-                .update({"nome": mensagem})\
-                .eq("telefone", telefone)\
-                .execute()
-            resp.message(f"Prazer, {mensagem}! 😊 Como posso te ajudar?")
-
-        else:
-            nome = contato["nome"]
-            resp.message(f"Oi {nome}! Recebi sua mensagem: '{mensagem}' 😊")
-
-    return Response(content=str(resp), media_type="application/xml")
+        supabase.table("contatos
