@@ -19,9 +19,9 @@ def perguntar_claude(nome: str, mensagem: str) -> str:
     response = claude.messages.create(
         model="claude-opus-4-20250514",
         max_tokens=500,
-        system=f"""Você é um assistente virtual simpático e prestativo chamado Robo. 
-        Você está conversando com {nome} via WhatsApp.
-        Responda de forma curta e amigável, máximo 3 frases.""",
+        system=f"""Voce e um assistente virtual simpatico chamado Robo.
+        Voce esta conversando com {nome} via WhatsApp.
+        Responda de forma curta e amigavel, maximo 3 frases.""",
         messages=[
             {"role": "user", "content": mensagem}
         ]
@@ -40,12 +40,24 @@ async def webhook(
     telefone = From
     mensagem = Body.strip()
 
-    resultado = supabase.table("contatos")\
-        .select("*")\
-        .eq("telefone", telefone)\
-        .execute()
+    resultado = supabase.table("contatos").select("*").eq("telefone", telefone).execute()
 
     resp = MessagingResponse()
 
     if not resultado.data:
-        supabase.table("contatos
+        supabase.table("contatos").insert({"telefone": telefone, "nome": None}).execute()
+        resp.message("Ola! Seja bem-vindo! Qual e o seu nome?")
+
+    else:
+        contato = resultado.data[0]
+
+        if not contato.get("nome"):
+            supabase.table("contatos").update({"nome": mensagem}).eq("telefone", telefone).execute()
+            resp.message(f"Prazer, {mensagem}! Como posso te ajudar?")
+
+        else:
+            nome = contato["nome"]
+            resposta_ia = perguntar_claude(nome, mensagem)
+            resp.message(resposta_ia)
+
+    return Response(content=str(resp), media_type="application/xml")
