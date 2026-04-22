@@ -1,67 +1,52 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse
-from supabase import create_client
 import os
+from fastapi import FastAPI, Request, Form, Response
+from supabase import create_client, Client
+from twilio.twiml.messaging_response import MessagingResponse
 
 app = FastAPI()
 
-# URL fixa do seu projeto Supabase
-SUPABASE_URL = "https://evhatuahmdoobyawmapw.supabase.co"
-
-# Só a chave vem do Railway
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
-if not SUPABASE_KEY:
-    raise ValueError("SUPABASE_KEY não configurada no Railway")
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-@app.get("/")
-def home():
-    return {"status": "ok"}
-
-@app.get("/debug")
-def debug():
-    return {
-        "supabase_url": SUPABASE_URL,
-        "supabase_key_ok": bool(SUPABASE_KEY),
-    }
+supabase: Client = create_client(
+    os.environ["SUPABASE_URL"],
+    os.environ["SUPABASE_KEY"]
+)
 
 @app.post("/webhook")
-async def webhook(request: Request):
-    data = await request.form()
+async def webhook(
+    From: str = Form(...),
+    Body: str = Form(...)
+):
+    telefone = From
+    mensagem = Body.strip()
 
-    numero = data.get("From")
-    mensagem = data.get("Body")
+    # Busca contato no banco
+    resultado = supabase.table("contatos")\
+        .select("*")\
+        .eq("telefone", telefone)\
+        .execute()
 
-    contato = supabase.table("contatos").upsert({
-        "telefone": numero
-    }).execute()
+    resp = MessagingResponse()
 
-    contato_id = contato.data[0]["id"]
+    if not resultado.data:
+        # Primeiro contato — salva e pergunta o nome
+        supabase.table("contatos")\
+            .insert({"telefone": telefone, "nome": None})\
+            .execute()
+        resp.message("Olá! 👋 Seja bem-vindo! Qual é o seu nome?")
 
-    conversa = supabase.table("conversas").insert({
-        "contato_id": contato_id,
-        "numero_whatsapp": numero
-    }).execute()
+    else:
+        contato = resultado.data[0]
 
-    conversa_id = conversa.data[0]["id"]
+        if not contato.get("nome"):
+            # Ainda não tem nome — salva o nome que veio
+            supabase.table("contatos")\
+                .update({"nome": mensagem})\
+                .eq("telefone", telefone)\
+                .execute()
+            resp.message(f"Prazer, {mensagem}! 😊 Como posso te ajudar?")
 
-    supabase.table("mensagens").insert({
-        "conversa_id": conversa_id,
-        "texto": mensagem,
-        "quem_enviou": "cliente"
-    }).execute()
+        else:
+            # Já tem nome — responde normalmente
+            nome = contato["nome"]
+            resp.message(f"Oi {nome}! Recebi sua mensagem: '{mensagem}' 😊")
 
-    resposta = "Olá! Recebi sua mensagem. Em breve um atendente vai falar com você."
-
-    supabase.table("mensagens").insert({
-        "conversa_id": conversa_id,
-        "texto": resposta,
-        "quem_enviou": "bot"
-    }).execute()
-
-    return PlainTextResponse(
-        f"<Response><Message>{resposta}</Message></Response>",
-        media_type="application/xml"
-    )
+    return Response(content=str(resp), media_type="application/xml")
