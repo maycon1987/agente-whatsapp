@@ -4,3 +4,4 @@ supabase
 httpx==0.27.0
 twilio
 python-multipart
+anthropic
