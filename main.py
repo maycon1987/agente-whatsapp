@@ -10,6 +10,10 @@ supabase: Client = create_client(
     os.environ["SUPABASE_KEY"]
 )
 
+@app.get("/")
+async def root():
+    return {"status": "Bot rodando!"}
+
 @app.post("/webhook")
 async def webhook(
     From: str = Form(...),
@@ -50,3 +54,8 @@ async def webhook(
             resp.message(f"Oi {nome}! Recebi sua mensagem: '{mensagem}' 😊")
 
     return Response(content=str(resp), media_type="application/xml")
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
