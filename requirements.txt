@@ -1,8 +1,7 @@
 fastapi
 uvicorn
 supabase
+requests
 python-multipart
 twilio
 anthropic
-pandas
-openpyxl
